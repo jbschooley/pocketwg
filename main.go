@@ -29,6 +29,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -720,8 +721,14 @@ func (a *App) authed(h http.HandlerFunc) http.HandlerFunc {
 func (a *App) tunnelsJSON() []map[string]any {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	var list []map[string]any
-	for _, t := range a.store.Tunnels {
+	names := make([]string, 0, len(a.store.Tunnels))
+	for n := range a.store.Tunnels {
+		names = append(names, n)
+	}
+	sort.Strings(names) // stable, name-sorted order (map iteration is random otherwise)
+	list := make([]map[string]any, 0, len(names))
+	for _, n := range names {
+		t := a.store.Tunnels[n]
 		st := a.status(t.Name)
 		list = append(list, map[string]any{"name": t.Name, "enabled": t.Enabled,
 			"autostart": t.Autostart, "status": st})
@@ -923,19 +930,46 @@ func (a *App) serveLocal(sockPath string) {
 	http.Serve(l, mux)
 }
 
-// restore brings up tunnels marked enabled (called at start).
-func (a *App) restore() {
+// ifaceUp reports whether a network interface with this name currently exists.
+func (a *App) ifaceUp(name string) bool {
+	_, err := run(a.ipBin, "link", "show", name)
+	return err == nil
+}
+
+// reconcile makes the live interface state match the desired (enabled) state at startup.
+// It's called on every pocketwg start, so it must handle three cases without disrupting
+// what's already correct:
+//   - enabled + already up  -> ADOPT it (leave the working interface + its rules alone);
+//   - enabled + down         -> bring it up (auto-start what was enabled);
+//   - disabled + up          -> tear down the orphan (e.g. a tunnel left running when a
+//                               previous pocketwg died — its engine/interface outlive it).
+// Adopting matters: a bare restart of pocketwg shouldn't flap a healthy tunnel.
+func (a *App) reconcile() {
 	a.mu.Lock()
-	var toUp []*Tunnel
-	for _, t := range a.store.Tunnels {
-		if t.Enabled {
-			toUp = append(toUp, t)
-		}
+	names := make([]string, 0, len(a.store.Tunnels))
+	for n := range a.store.Tunnels {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	tunnels := make([]*Tunnel, 0, len(names))
+	for _, n := range names {
+		tunnels = append(tunnels, a.store.Tunnels[n])
 	}
 	a.mu.Unlock()
-	for _, t := range toUp {
-		if err := a.up(t); err != nil {
-			log.Printf("restore %s: %v", t.Name, err)
+	for _, t := range tunnels {
+		up := a.ifaceUp(t.Name)
+		switch {
+		case t.Enabled && !up:
+			if err := a.up(t); err != nil {
+				log.Printf("reconcile: bring up %s: %v", t.Name, err)
+			} else {
+				log.Printf("reconcile: started %s (was enabled)", t.Name)
+			}
+		case t.Enabled && up:
+			log.Printf("reconcile: adopted already-up %s", t.Name)
+		case !t.Enabled && up:
+			log.Printf("reconcile: tore down orphaned %s (disabled but up)", t.Name)
+			a.down(t)
 		}
 	}
 }
@@ -972,7 +1006,7 @@ func main() {
 	}
 	app.ensureModule()
 	app.cleanupStaleDNS() // undo any DNS poison from an unclean prior shutdown, before bring-up
-	app.restore()
+	app.reconcile()       // start enabled tunnels, adopt already-up ones, clean orphans
 	go app.serveLocal(sock)
 
 	mux := http.NewServeMux()
