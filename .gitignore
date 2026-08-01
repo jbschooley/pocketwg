@@ -1,0 +1,11 @@
+# build output
+/dist/
+
+# arch-specific binaries / build artifacts
+*.ko
+
+# misc
+.DS_Store
+go.work
+go.work.sum
+*.tmp

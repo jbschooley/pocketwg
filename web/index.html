@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pocketwg</title>
+<style>
+  :root { color-scheme: light dark; --bg:#f5f6f8; --card:#fff; --fg:#1a1c20; --mut:#6b7280;
+          --acc:#2563eb; --ok:#16a34a; --off:#9ca3af; --bd:#e5e7eb; --err:#dc2626; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#0f1115; --card:#1a1d23; --fg:#e6e8ec; --mut:#9aa1ad; --bd:#2b2f38; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; font:15px/1.5 system-ui,sans-serif; background:var(--bg); color:var(--fg); }
+  header { display:flex; align-items:center; justify-content:space-between; padding:14px 18px;
+           background:var(--card); border-bottom:1px solid var(--bd); position:sticky; top:0; }
+  header h1 { font-size:16px; margin:0; font-weight:600; }
+  header h1 span { color:var(--acc); }
+  main { max-width:760px; margin:0 auto; padding:18px; }
+  .card { background:var(--card); border:1px solid var(--bd); border-radius:12px; padding:16px; margin-bottom:14px; }
+  .row { display:flex; align-items:center; justify-content:space-between; gap:10px; }
+  input, textarea, button { font:inherit; }
+  input, textarea { width:100%; padding:9px 11px; border:1px solid var(--bd); border-radius:8px;
+                    background:var(--bg); color:var(--fg); }
+  textarea { min-height:150px; font-family:ui-monospace,monospace; font-size:13px; }
+  label { display:block; font-size:13px; color:var(--mut); margin:10px 0 4px; }
+  button { padding:9px 14px; border:0; border-radius:8px; background:var(--acc); color:#fff;
+           cursor:pointer; font-weight:500; }
+  button.ghost { background:transparent; color:var(--mut); border:1px solid var(--bd); }
+  button.danger { background:transparent; color:var(--err); border:1px solid var(--bd); }
+  button:disabled { opacity:.5; cursor:default; }
+  .tname { font-weight:600; font-size:15px; }
+  .badge { font-size:12px; padding:2px 9px; border-radius:20px; color:#fff; }
+  .badge.up { background:var(--ok); } .badge.down { background:var(--off); }
+  .meta { color:var(--mut); font-size:13px; margin-top:6px; }
+  .meta code { font-size:12px; }
+  .switch { position:relative; width:46px; height:26px; flex:0 0 auto; }
+  .switch input { display:none; }
+  .slider { position:absolute; inset:0; background:var(--off); border-radius:26px; transition:.2s; cursor:pointer; }
+  .slider:before { content:""; position:absolute; width:20px; height:20px; left:3px; top:3px;
+                   background:#fff; border-radius:50%; transition:.2s; }
+  .switch input:checked + .slider { background:var(--ok); }
+  .switch input:checked + .slider:before { transform:translateX(20px); }
+  .err { color:var(--err); font-size:13px; margin-top:8px; min-height:18px; }
+  .muted { color:var(--mut); }
+  .hidden { display:none; }
+  .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+  h2 { font-size:15px; margin:0 0 10px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Wire<span>Guard</span> · pocketwg</h1>
+  <button id="logout" class="ghost hidden">Log out</button>
+</header>
+<main>
+  <!-- first-run setup -->
+  <div id="view-setup" class="card hidden">
+    <h2>Set up admin login</h2>
+    <p class="muted">First run — choose a username and password for this WireGuard console.</p>
+    <label>Username</label><input id="su-user" autocomplete="username">
+    <label>Password (min 8)</label><input id="su-pass" type="password" autocomplete="new-password">
+    <div class="err" id="su-err"></div>
+    <button id="su-go" style="margin-top:10px">Create</button>
+  </div>
+
+  <!-- login -->
+  <div id="view-login" class="card hidden">
+    <h2>Log in</h2>
+    <label>Username</label><input id="li-user" autocomplete="username">
+    <label>Password</label><input id="li-pass" type="password" autocomplete="current-password">
+    <div class="err" id="li-err"></div>
+    <button id="li-go" style="margin-top:10px">Log in</button>
+  </div>
+
+  <!-- main app -->
+  <div id="view-app" class="hidden">
+    <div id="tunnels"></div>
+    <div class="card">
+      <h2>Add a tunnel</h2>
+      <label>Name</label><input id="im-name" placeholder="wg0">
+      <label>Config (.conf) — paste or choose a file</label>
+      <input type="file" id="im-file" accept=".conf,text/plain" style="margin-bottom:8px">
+      <textarea id="im-conf" placeholder="[Interface]&#10;PrivateKey = ...&#10;Address = 10.0.0.2/32&#10;&#10;[Peer]&#10;PublicKey = ...&#10;Endpoint = 1.2.3.4:51820&#10;AllowedIPs = 0.0.0.0/0"></textarea>
+      <div class="err" id="im-err"></div>
+      <div class="row" style="margin-top:10px; justify-content:flex-start; gap:8px">
+        <button id="im-go">Import</button>
+        <button id="im-key" class="ghost">Generate keypair</button>
+      </div>
+      <div id="im-keyout" class="meta hidden"></div>
+    </div>
+  </div>
+</main>
+<footer style="text-align:center;color:var(--mut);font-size:12px;padding:14px 16px 24px">
+  pocketwg · <a href="https://github.com/jbschooley/pocketwg" style="color:var(--mut)">source</a>
+  · AGPL-3.0 · no warranty
+</footer>
+<script src="app.js"></script>
+</body>
+</html>

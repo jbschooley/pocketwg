@@ -1,0 +1,19 @@
+[Unit]
+Description=pocketwg — WireGuard tunnel manager
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/pocketwg
+# Defaults: web UI on :8088, state in /var/lib/pocketwg, wg/ip from PATH.
+# Override as needed:
+#   Environment=PWG_HTTP=127.0.0.1:8088
+#   Environment=PWG_DATA=/var/lib/pocketwg
+Restart=on-failure
+RestartSec=3
+# Needs network-admin to manage interfaces; run as root or grant the capability:
+AmbientCapabilities=CAP_NET_ADMIN
+StateDirectory=pocketwg
+
+[Install]
+WantedBy=multi-user.target
