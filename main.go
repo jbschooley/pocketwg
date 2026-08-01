@@ -32,6 +32,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"golang.org/x/crypto/bcrypt"
@@ -485,10 +486,44 @@ func (a *App) teardownIface(t *Tunnel) {
 		run(a.ipBin, fam, "route", "flush", "table", mark) // drop default + pinned endpoint /32
 	}
 	if a.backend == "userspace" {
-		// tear down the userspace impl + its UAPI socket (ip link del removes the TUN,
-		// which makes wireguard-go exit; kill defensively in case it lingers).
-		run("pkill", "-f", a.wggoBin+".*"+t.Name)
+		// tear down the userspace impl + its UAPI socket. `ip link del` removes the TUN,
+		// which normally makes the engine exit, but kill it explicitly too: a lingering
+		// boringtun keeps ownership of the UAPI socket, so the next bring-up starts a
+		// second instance that fights it for the socket/TUN and wedges the tunnel (tx=0).
+		killByCmdline(a.wggoBin, t.Name)
 		os.Remove("/var/run/wireguard/" + t.Name + ".sock")
+	}
+}
+
+// killByCmdline SIGKILLs every process whose /proc cmdline contains all the given
+// substrings. Replaces a dependency on pkill, which minimal userlands (busybox without
+// procps) don't ship — a missing pkill silently no-ops and lets stale engines pile up.
+func killByCmdline(subs ...string) {
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return
+	}
+	self := os.Getpid()
+	for _, e := range entries {
+		pid, err := strconv.Atoi(e.Name())
+		if err != nil || pid == self {
+			continue
+		}
+		data, err := os.ReadFile("/proc/" + e.Name() + "/cmdline")
+		if err != nil {
+			continue
+		}
+		cmd := strings.ReplaceAll(string(data), "\x00", " ")
+		match := true
+		for _, s := range subs {
+			if !strings.Contains(cmd, s) {
+				match = false
+				break
+			}
+		}
+		if match {
+			syscall.Kill(pid, syscall.SIGKILL)
+		}
 	}
 }
 
