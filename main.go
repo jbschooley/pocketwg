@@ -522,11 +522,58 @@ func (a *App) handleTunnelItem(w http.ResponseWriter, r *http.Request) {
 		a.handleEnable(w, r)
 	case strings.HasSuffix(r.URL.Path, "/disable") && r.Method == http.MethodPost:
 		a.handleDisable(w, r)
+	case strings.HasSuffix(r.URL.Path, "/config") && r.Method == http.MethodGet:
+		a.handleGetConfig(w, r)
+	case r.Method == http.MethodPut:
+		a.handleUpdate(w, r)
 	case r.Method == http.MethodDelete:
 		a.handleDelete(w, r)
 	default:
 		w.WriteHeader(405)
 	}
+}
+
+// handleGetConfig returns a tunnel's raw config for editing.
+func (a *App) handleGetConfig(w http.ResponseWriter, r *http.Request) {
+	name := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/tunnels/"), "/config")
+	a.mu.Lock()
+	t := a.store.Tunnels[name]
+	a.mu.Unlock()
+	if t == nil {
+		writeJSON(w, 404, map[string]string{"error": "no such tunnel: " + name})
+		return
+	}
+	writeJSON(w, 200, map[string]string{"name": t.Name, "conf": t.Conf})
+}
+
+// handleUpdate replaces a tunnel's config; if it's currently enabled, re-applies it live.
+func (a *App) handleUpdate(w http.ResponseWriter, r *http.Request) {
+	name := strings.TrimPrefix(r.URL.Path, "/api/tunnels/")
+	var req struct{ Conf string }
+	json.NewDecoder(r.Body).Decode(&req)
+	if !strings.Contains(strings.ToLower(req.Conf), "[interface]") {
+		writeJSON(w, 400, map[string]string{"error": "config missing [Interface]"})
+		return
+	}
+	a.mu.Lock()
+	t := a.store.Tunnels[name]
+	if t == nil {
+		a.mu.Unlock()
+		writeJSON(w, 404, map[string]string{"error": "no such tunnel: " + name})
+		return
+	}
+	t.Conf = req.Conf
+	wasEnabled := t.Enabled
+	a.save()
+	a.mu.Unlock()
+	if wasEnabled { // re-apply live so the edit takes effect immediately
+		a.down(t)
+		if err := a.up(t); err != nil {
+			writeJSON(w, 500, map[string]string{"error": "saved, but re-apply failed: " + err.Error()})
+			return
+		}
+	}
+	writeJSON(w, 200, map[string]string{"status": "ok"})
 }
 
 // ---------- local unix socket for the touch UI (no auth; local root only) ----------

@@ -84,11 +84,15 @@ async function refresh() {
         handshake ${fmtAgo(peer.last_handshake)} ·
         ↓ ${fmtBytes(peer.rx_bytes)} ↑ ${fmtBytes(peer.tx_bytes)}
       </div>
-      <div class="row" style="margin-top:10px; justify-content:flex-end">
+      <div class="row" style="margin-top:10px; justify-content:flex-end; gap:8px">
+        <button class="ghost" data-edit="${t.name}">Edit</button>
         <button class="danger" data-del="${t.name}">Delete</button>
       </div>`;
     box.appendChild(card);
   }
+  box.querySelectorAll("button[data-edit]").forEach((el) => {
+    el.onclick = () => editTunnel(el.dataset.edit, el.closest(".card"));
+  });
   box.querySelectorAll("input[data-n]").forEach((el) => {
     el.onchange = async () => {
       el.disabled = true;
@@ -105,6 +109,28 @@ async function refresh() {
       refresh();
     };
   });
+}
+
+// ---- edit an existing tunnel ----
+async function editTunnel(name, card) {
+  const { ok, body } = await api(`/api/tunnels/${name}/config`);
+  if (!ok) return;
+  card.innerHTML = `
+    <div class="tname">Edit ${name}</div>
+    <textarea class="ed-conf" spellcheck="false"></textarea>
+    <div class="err ed-err"></div>
+    <div class="row" style="margin-top:10px; justify-content:flex-end; gap:8px">
+      <button class="ghost ed-cancel">Cancel</button>
+      <button class="ed-save">Save &amp; re-apply</button>
+    </div>`;
+  const ta = card.querySelector(".ed-conf");
+  ta.value = body.conf; // set via value to avoid HTML escaping issues
+  card.querySelector(".ed-cancel").onclick = refresh;
+  card.querySelector(".ed-save").onclick = async () => {
+    const r = await api(`/api/tunnels/${name}`, { method: "PUT", body: JSON.stringify({ Conf: ta.value }) });
+    if (!r.ok) { card.querySelector(".ed-err").textContent = r.body.error || "error"; return; }
+    refresh();
+  };
 }
 
 // ---- import ----
