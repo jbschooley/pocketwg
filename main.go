@@ -64,6 +64,8 @@ type App struct {
 	dataPath string
 	wgBin    string
 	ipBin    string
+	wggoBin  string // userspace WireGuard impl (wireguard-go / boringtun-cli)
+	backend  string // "kernel" (ip link add type wireguard) or "userspace" (TUN via wggoBin)
 
 	sessMu   sync.Mutex
 	sessions map[string]time.Time // token -> expiry
@@ -185,8 +187,16 @@ func (a *App) up(t *Tunnel) error {
 	tmp.Close()
 
 	a.down(t) // idempotent: clear any stale iface
-	if _, err := run(a.ipBin, "link", "add", "dev", t.Name, "type", "wireguard"); err != nil {
-		return err
+	// Create the WireGuard interface. Either backend leaves a device named t.Name that
+	// `wg` configures identically (userspace impls expose the same UAPI socket).
+	if a.backend == "userspace" {
+		if _, err := run(a.wggoBin, t.Name); err != nil {
+			return fmt.Errorf("userspace backend (%s): %w", a.wggoBin, err)
+		}
+	} else {
+		if _, err := run(a.ipBin, "link", "add", "dev", t.Name, "type", "wireguard"); err != nil {
+			return err
+		}
 	}
 	if _, err := run(a.wgBin, "setconf", t.Name, tmp.Name()); err != nil {
 		a.down(t)
@@ -223,6 +233,12 @@ func (a *App) up(t *Tunnel) error {
 
 func (a *App) down(t *Tunnel) error {
 	run(a.ipBin, "link", "del", "dev", t.Name)
+	if a.backend == "userspace" {
+		// tear down the userspace impl + its UAPI socket (ip link del removes the TUN,
+		// which makes wireguard-go exit; kill defensively in case it lingers).
+		run("pkill", "-f", a.wggoBin+" "+t.Name)
+		os.Remove("/var/run/wireguard/" + t.Name + ".sock")
+	}
 	return nil
 }
 
@@ -231,6 +247,9 @@ func (a *App) down(t *Tunnel) error {
 // PWG_MODLOAD at an insmod sequence. Run via `sh -c` so the value may be a
 // multi-command load chain. Best-effort (ignored if WG is built-in).
 func (a *App) ensureModule() {
+	if a.backend == "userspace" {
+		return // userspace impl uses TUN; no wireguard kernel module needed
+	}
 	cmd := os.Getenv("PWG_MODLOAD")
 	if cmd == "" {
 		cmd = "modprobe wireguard"
@@ -568,11 +587,17 @@ func main() {
 	sock := envOr("PWG_SOCK", filepath.Join(data, "pocketwg.sock"))
 	wgBin := envOr("PWG_WG", "wg") // from PATH on a normal distro
 	ipBin := envOr("PWG_IP", "ip")
+	// Backend: "kernel" uses the in-kernel wireguard netdev (ip link add type wireguard);
+	// "userspace" runs a userspace impl (wireguard-go/boringtun) over TUN — same `wg`
+	// control plane, no kernel module needed. Useful where wireguard.ko is unavailable
+	// or ABI-incompatible with the running kernel.
+	backend := envOr("PWG_WG_BACKEND", "kernel")
+	wggoBin := envOr("PWG_WGGO", "wireguard-go")
 
 	os.MkdirAll(data, 0700)
 	app := &App{
 		dataPath: filepath.Join(data, "pocketwg.json"),
-		wgBin:    wgBin, ipBin: ipBin,
+		wgBin:    wgBin, ipBin: ipBin, wggoBin: wggoBin, backend: backend,
 		sessions: map[string]time.Time{},
 	}
 	if err := app.load(); err != nil {
