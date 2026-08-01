@@ -106,6 +106,10 @@ type parsedConf struct {
 	mtu       string
 	wgConf    string // only the [Interface]/[Peer] keys that `wg setconf` accepts
 	allowed   []string
+	preUp     []string // wg-quick hooks (run via sh -c, %i -> iface name)
+	postUp    []string
+	preDown   []string
+	postDown  []string
 }
 
 // parseConf splits a wg-quick config into the `wg setconf` portion (crypto/peers)
@@ -144,6 +148,18 @@ func parseConf(conf string) parsedConf {
 			case "mtu":
 				p.mtu = val
 				continue
+			case "preup":
+				p.preUp = append(p.preUp, val)
+				continue
+			case "postup":
+				p.postUp = append(p.postUp, val)
+				continue
+			case "predown":
+				p.preDown = append(p.preDown, val)
+				continue
+			case "postdown":
+				p.postDown = append(p.postDown, val)
+				continue
 			case "privatekey", "listenport", "fwmark":
 				out.WriteString(key + " = " + val + "\n")
 			}
@@ -177,6 +193,16 @@ func run(bin string, args ...string) (string, error) {
 	return string(out), nil
 }
 
+// runHook executes a wg-quick-style PreUp/PostUp/PreDown/PostDown command via `sh -c`,
+// substituting %i with the interface name (as wg-quick does). Best-effort: a failing
+// hook is logged but does not abort tunnel bring-up/tear-down.
+func runHook(kind, iface, cmd string) {
+	c := strings.ReplaceAll(cmd, "%i", iface)
+	if out, err := run("sh", "-c", c); err != nil {
+		log.Printf("%s hook (%s): %v", kind, iface, strings.TrimSpace(out))
+	}
+}
+
 func (a *App) up(t *Tunnel) error {
 	p := parseConf(t.Conf)
 	tmp, err := os.CreateTemp("", "wg-*.conf")
@@ -187,7 +213,10 @@ func (a *App) up(t *Tunnel) error {
 	tmp.WriteString(p.wgConf)
 	tmp.Close()
 
-	a.down(t) // idempotent: clear any stale iface
+	a.teardownIface(t) // idempotent: clear any stale iface (no hooks)
+	for _, h := range p.preUp {
+		runHook("PreUp", t.Name, h)
+	}
 	// Create the WireGuard interface. Either backend leaves a device named t.Name that
 	// `wg` configures identically (userspace impls expose the same UAPI socket).
 	if a.backend == "userspace" {
@@ -201,7 +230,7 @@ func (a *App) up(t *Tunnel) error {
 		}
 	}
 	if _, err := run(a.wgBin, "setconf", t.Name, tmp.Name()); err != nil {
-		a.down(t)
+		a.teardownIface(t)
 		return err
 	}
 	for _, addr := range p.addresses {
@@ -215,7 +244,7 @@ func (a *App) up(t *Tunnel) error {
 		run(a.ipBin, "link", "set", "mtu", p.mtu, "dev", t.Name)
 	}
 	if _, err := run(a.ipBin, "link", "set", "up", "dev", t.Name); err != nil {
-		a.down(t)
+		a.teardownIface(t)
 		return err
 	}
 	// v1 routing: add a device route for each non-default AllowedIP. Full-tunnel
@@ -230,16 +259,32 @@ func (a *App) up(t *Tunnel) error {
 		}
 		run(a.ipBin, fam, "route", "add", cidr, "dev", t.Name)
 	}
+	for _, h := range p.postUp {
+		runHook("PostUp", t.Name, h)
+	}
 	return nil
 }
 
-func (a *App) down(t *Tunnel) error {
+// teardownIface removes the WireGuard interface (and, for the userspace backend, its
+// engine + UAPI socket). It runs NO hooks — up() uses it for the idempotent pre-clear.
+func (a *App) teardownIface(t *Tunnel) {
 	run(a.ipBin, "link", "del", "dev", t.Name)
 	if a.backend == "userspace" {
 		// tear down the userspace impl + its UAPI socket (ip link del removes the TUN,
 		// which makes wireguard-go exit; kill defensively in case it lingers).
 		run("pkill", "-f", a.wggoBin+".*"+t.Name)
 		os.Remove("/var/run/wireguard/" + t.Name + ".sock")
+	}
+}
+
+func (a *App) down(t *Tunnel) error {
+	p := parseConf(t.Conf)
+	for _, h := range p.preDown {
+		runHook("PreDown", t.Name, h)
+	}
+	a.teardownIface(t)
+	for _, h := range p.postDown {
+		runHook("PostDown", t.Name, h)
 	}
 	return nil
 }
