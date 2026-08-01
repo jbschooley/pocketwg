@@ -12,7 +12,10 @@ no dependencies — it drives the in-kernel WireGuard module via `wg` + `ip`.
 
 - **Import `.conf`** (upload or paste) — manage multiple client tunnels.
 - **Enable/disable** each tunnel with a toggle; **live status**: up/down, endpoint, last handshake, rx/tx.
-- **wg-quick hooks** — `PreUp`/`PostUp`/`PreDown`/`PostDown` in the config are executed (via `sh -c`, `%i` → iface), so per-tunnel firewall/route/NAT tweaks live in the config itself.
+- **wg-quick parity** — honors `Address`, `MTU`, `DNS` (resolver set/restore), `Table`, and
+  full-tunnel routing (`AllowedIPs = 0.0.0.0/0` via fwmark policy routing + a pinned endpoint
+  route so it works with **userspace** backends too), plus `PreUp`/`PostUp`/`PreDown`/`PostDown`
+  hooks (via `sh -c`, `%i` → iface) — so per-tunnel firewall/route/NAT tweaks live in the config.
 - **Generate keypairs** (Curve25519, in-process — no shell-out).
 - **Own login** (independent username/password, set on first run; bcrypt-hashed).
 - **Single static binary** (`CGO_ENABLED=0`) — runs on glibc *or* musl; **multi-arch** (arm64, amd64, arm, mipsle, …).
@@ -74,7 +77,6 @@ matching kernel module and point `PWG_MODLOAD` at your module-load command (an `
 
 ## Roadmap
 
-- **wg-quick parity**: full-tunnel routing (`AllowedIPs = 0.0.0.0/0` via policy routing + fwmark) and DNS handling.
 - **On-device touch UI** (LVGL) for embedded screens, via the local control socket.
 - Optional **OpenWrt uci/netifd** backend mode.
 - **TLS** for LAN/remote admin (currently plain HTTP — bind localhost or reverse-proxy meanwhile).

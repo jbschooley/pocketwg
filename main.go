@@ -106,7 +106,11 @@ type parsedConf struct {
 	mtu       string
 	wgConf    string // only the [Interface]/[Peer] keys that `wg setconf` accepts
 	allowed   []string
-	preUp     []string // wg-quick hooks (run via sh -c, %i -> iface name)
+	dns       []string // Interface DNS = ... (nameserver IPs)
+	dnsSearch []string // Interface DNS = ... (non-IP entries -> search domains)
+	table     string   // Interface Table = auto|off|<id> ("" == auto)
+	saveConf  bool      // Interface SaveConfig = true (recognized; no-op here)
+	preUp     []string  // wg-quick hooks (run via sh -c, %i -> iface name)
 	postUp    []string
 	preDown   []string
 	postDown  []string
@@ -144,6 +148,23 @@ func parseConf(conf string) parsedConf {
 				}
 				continue // wg-quick-only; not for `wg setconf`
 			case "dns":
+				// IPs -> nameservers; anything else -> search domains (wg-quick semantics).
+				for _, d := range strings.Split(val, ",") {
+					if d = strings.TrimSpace(d); d == "" {
+						continue
+					}
+					if net.ParseIP(d) != nil {
+						p.dns = append(p.dns, d)
+					} else {
+						p.dnsSearch = append(p.dnsSearch, d)
+					}
+				}
+				continue
+			case "table":
+				p.table = strings.ToLower(val)
+				continue
+			case "saveconfig":
+				p.saveConf = strings.EqualFold(val, "true")
 				continue
 			case "mtu":
 				p.mtu = val
@@ -247,28 +268,222 @@ func (a *App) up(t *Tunnel) error {
 		a.teardownIface(t)
 		return err
 	}
-	// v1 routing: add a device route for each non-default AllowedIP. Full-tunnel
-	// (0.0.0.0/0) via policy routing is a later enhancement; skip 0.0.0.0/0 / ::/0.
-	for _, cidr := range p.allowed {
-		if cidr == "0.0.0.0/0" || cidr == "::/0" {
-			continue
-		}
-		fam := "-4"
-		if strings.Contains(cidr, ":") {
-			fam = "-6"
-		}
-		run(a.ipBin, fam, "route", "add", cidr, "dev", t.Name)
-	}
+	a.addRoutes(t, p)
+	a.applyDNS(t, p)
 	for _, h := range p.postUp {
 		runHook("PostUp", t.Name, h)
 	}
 	return nil
 }
 
+// fwmarkFor returns a stable routing table id / fwmark for a tunnel, used for
+// full-tunnel (Table=auto with a /0 AllowedIP). It is deliberately kept out of the
+// device's fwmark bits (this platform runs WWAN policy routing under mask 0x35), so
+// pick a base whose low bits don't overlap and offset by a hash of the name.
+func fwmarkFor(name string) string {
+	var h uint32 = 2166136261
+	for i := 0; i < len(name); i++ { // FNV-1a, no rand (deterministic across restarts)
+		h ^= uint32(name[i])
+		h *= 16777619
+	}
+	// 0x8880 base (0x8880 & 0x35 == 0); vary in the high nibble only, still & 0x35 == 0.
+	return strconv.Itoa(int(0x8880 + (h%8)*0x1000))
+}
+
+// addRoutes installs routes for the tunnel's AllowedIPs following wg-quick's Table rules:
+//   Table=off      -> no routes;
+//   Table=<id>     -> plain routes into that table;
+//   Table=auto ("")-> plain routes, unless a default route (0.0.0.0/0 or ::/0) is present,
+//                     in which case use policy routing (fwmark + suppress_prefixlength) so
+//                     the encrypted WG packets themselves aren't looped back into the tunnel.
+func (a *App) addRoutes(t *Tunnel, p parsedConf) {
+	if p.table == "off" {
+		return
+	}
+	hasV4Def, hasV6Def := false, false
+	for _, c := range p.allowed {
+		switch c {
+		case "0.0.0.0/0":
+			hasV4Def = true
+		case "::/0":
+			hasV6Def = true
+		}
+	}
+	auto := p.table == "" || p.table == "auto"
+	if auto && (hasV4Def || hasV6Def) {
+		mark := fwmarkFor(t.Name)
+		run(a.wgBin, "set", t.Name, "fwmark", mark)
+		// Keep the encrypted WG packets out of the tunnel. The kernel backend marks its
+		// own socket (SO_MARK=fwmark), so the `not fwmark` rule below diverts everything
+		// EXCEPT those to the tunnel table. Userspace backends (boringtun) don't reliably
+		// SO_MARK, so their unmarked handshake packets would match `not fwmark` and loop
+		// back into the tunnel. Guard both cases by pinning a /32 host route to each peer
+		// endpoint via the current WAN path, inside the tunnel table (more specific than
+		// its default), so endpoint traffic always egresses the real uplink.
+		for _, ip := range a.peerEndpoints(t.Name) {
+			a.pinEndpointRoute(ip, mark)
+		}
+		for _, c := range p.allowed {
+			fam := "-4"
+			if strings.Contains(c, ":") {
+				fam = "-6"
+			}
+			run(a.ipBin, fam, "route", "add", c, "dev", t.Name, "table", mark)
+		}
+		if hasV4Def {
+			run("sysctl", "-wq", "net.ipv4.conf.all.src_valid_mark=1")
+			run(a.ipBin, "-4", "rule", "add", "not", "fwmark", mark, "table", mark)
+			run(a.ipBin, "-4", "rule", "add", "table", "main", "suppress_prefixlength", "0")
+		}
+		if hasV6Def {
+			run(a.ipBin, "-6", "rule", "add", "not", "fwmark", mark, "table", mark)
+			run(a.ipBin, "-6", "rule", "add", "table", "main", "suppress_prefixlength", "0")
+		}
+		return
+	}
+	for _, c := range p.allowed {
+		if auto && (c == "0.0.0.0/0" || c == "::/0") {
+			continue // no /0 handling outside the fwmark path
+		}
+		fam := "-4"
+		if strings.Contains(c, ":") {
+			fam = "-6"
+		}
+		args := []string{fam, "route", "add", c, "dev", t.Name}
+		if !auto {
+			args = append(args, "table", p.table)
+		}
+		run(a.ipBin, args...)
+	}
+}
+
+// peerEndpoints returns the current resolved endpoint IPs for a tunnel's peers, as WG
+// itself sees them (`wg show <iface> endpoints`), so the pinned route matches the exact
+// address WG sends to (avoids re-resolving to a different round-robin answer).
+func (a *App) peerEndpoints(iface string) []string {
+	out, err := run(a.wgBin, "show", iface, "endpoints")
+	if err != nil {
+		return nil
+	}
+	var ips []string
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Fields(line)
+		if len(f) < 2 {
+			continue
+		}
+		if h, _, err := net.SplitHostPort(f[1]); err == nil && h != "" {
+			ips = append(ips, h)
+		}
+	}
+	return ips
+}
+
+// pinEndpointRoute installs a /32 (or /128) host route to ip via the current default path,
+// into the given routing table, so encrypted WG packets to the peer bypass the tunnel.
+func (a *App) pinEndpointRoute(ip, table string) {
+	out, err := run(a.ipBin, "route", "get", ip)
+	if err != nil {
+		return
+	}
+	fields := strings.Fields(out)
+	var gw, dev string
+	for i := 0; i+1 < len(fields); i++ {
+		switch fields[i] {
+		case "via":
+			gw = fields[i+1]
+		case "dev":
+			dev = fields[i+1]
+		}
+	}
+	if dev == "" {
+		return // couldn't determine egress; leave routing as-is
+	}
+	prefix := "/32"
+	if strings.Contains(ip, ":") {
+		prefix = "/128"
+	}
+	args := []string{"route", "replace", ip + prefix}
+	if gw != "" {
+		args = append(args, "via", gw)
+	}
+	args = append(args, "dev", dev, "table", table)
+	run(a.ipBin, args...)
+}
+
+// applyDNS points the resolver at the tunnel's DNS servers (wg-quick DNS=). No resolvconf
+// here, so back up /etc/resolv.conf once and write it directly; restoreDNS puts it back.
+func (a *App) applyDNS(t *Tunnel, p parsedConf) {
+	if len(p.dns) == 0 {
+		return
+	}
+	bak := a.resolvBak(t)
+	if _, err := os.Stat(bak); err != nil {
+		if cur, err := os.ReadFile("/etc/resolv.conf"); err == nil {
+			os.WriteFile(bak, cur, 0644)
+		}
+	}
+	var b strings.Builder
+	b.WriteString("# pocketwg: DNS for " + t.Name + "\n")
+	for _, s := range p.dnsSearch {
+		b.WriteString("search " + s + "\n")
+	}
+	for _, ns := range p.dns {
+		b.WriteString("nameserver " + ns + "\n")
+	}
+	if err := os.WriteFile("/etc/resolv.conf", []byte(b.String()), 0644); err != nil {
+		log.Printf("applyDNS %s: %v", t.Name, err)
+	}
+}
+
+func (a *App) restoreDNS(t *Tunnel) {
+	bak := a.resolvBak(t)
+	if data, err := os.ReadFile(bak); err == nil {
+		os.WriteFile("/etc/resolv.conf", data, 0644)
+		os.Remove(bak)
+	}
+}
+
+func (a *App) resolvBak(t *Tunnel) string {
+	return filepath.Join(filepath.Dir(a.dataPath), "resolv."+t.Name+".bak")
+}
+
+// cleanupStaleDNS restores /etc/resolv.conf from any leftover backup at startup. A backup
+// only survives if a tunnel with DNS= was brought up but never cleanly torn down (crash,
+// kill, reboot). If left in place, the next bring-up's `wg setconf` would try to resolve
+// the peer Endpoint via a resolver that's only reachable *through* the not-yet-up tunnel,
+// deadlocking. Restoring first guarantees the endpoint resolves via the real upstream.
+func (a *App) cleanupStaleDNS() {
+	dir := filepath.Dir(a.dataPath)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		n := e.Name()
+		if strings.HasPrefix(n, "resolv.") && strings.HasSuffix(n, ".bak") {
+			bak := filepath.Join(dir, n)
+			if data, err := os.ReadFile(bak); err == nil {
+				os.WriteFile("/etc/resolv.conf", data, 0644)
+				log.Printf("restored /etc/resolv.conf from stale %s", n)
+			}
+			os.Remove(bak)
+		}
+	}
+}
+
 // teardownIface removes the WireGuard interface (and, for the userspace backend, its
-// engine + UAPI socket). It runs NO hooks — up() uses it for the idempotent pre-clear.
+// engine + UAPI socket) plus any full-tunnel policy-routing rules it may have added.
+// It runs NO hooks — up() uses it for the idempotent pre-clear. Deleting the link drops
+// its routes (including in the custom table), but ip rules are not link-scoped, so remove
+// them here by the tunnel's deterministic fwmark. Best-effort: absent rules just no-op.
 func (a *App) teardownIface(t *Tunnel) {
 	run(a.ipBin, "link", "del", "dev", t.Name)
+	mark := fwmarkFor(t.Name)
+	for _, fam := range []string{"-4", "-6"} {
+		run(a.ipBin, fam, "rule", "del", "not", "fwmark", mark, "table", mark)
+		run(a.ipBin, fam, "rule", "del", "table", "main", "suppress_prefixlength", "0")
+		run(a.ipBin, fam, "route", "flush", "table", mark) // drop default + pinned endpoint /32
+	}
 	if a.backend == "userspace" {
 		// tear down the userspace impl + its UAPI socket (ip link del removes the TUN,
 		// which makes wireguard-go exit; kill defensively in case it lingers).
@@ -282,6 +497,7 @@ func (a *App) down(t *Tunnel) error {
 	for _, h := range p.preDown {
 		runHook("PreDown", t.Name, h)
 	}
+	a.restoreDNS(t)
 	a.teardownIface(t)
 	for _, h := range p.postDown {
 		runHook("PostDown", t.Name, h)
@@ -511,20 +727,37 @@ func (a *App) tunnelByPath(r *http.Request, suffix string) (*Tunnel, string) {
 	return a.store.Tunnels[name], name
 }
 
+// enableTunnel/disableTunnel are the core state transitions, shared by the HTTP API and
+// the local touch socket (so both drive the same up()/down() + persist path).
+func (a *App) enableTunnel(t *Tunnel) error {
+	if err := a.up(t); err != nil {
+		return err
+	}
+	a.mu.Lock()
+	t.Enabled = true
+	a.save()
+	a.mu.Unlock()
+	return nil
+}
+
+func (a *App) disableTunnel(t *Tunnel) {
+	a.down(t)
+	a.mu.Lock()
+	t.Enabled = false
+	a.save()
+	a.mu.Unlock()
+}
+
 func (a *App) handleEnable(w http.ResponseWriter, r *http.Request) {
 	t, name := a.tunnelByPath(r, "/enable")
 	if t == nil {
 		writeJSON(w, 404, map[string]string{"error": "no such tunnel: " + name})
 		return
 	}
-	if err := a.up(t); err != nil {
+	if err := a.enableTunnel(t); err != nil {
 		writeJSON(w, 500, map[string]string{"error": err.Error()})
 		return
 	}
-	a.mu.Lock()
-	t.Enabled = true
-	a.save()
-	a.mu.Unlock()
 	writeJSON(w, 200, map[string]string{"status": "up"})
 }
 
@@ -534,11 +767,7 @@ func (a *App) handleDisable(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 404, map[string]string{"error": "no such tunnel: " + name})
 		return
 	}
-	a.down(t)
-	a.mu.Lock()
-	t.Enabled = false
-	a.save()
-	a.mu.Unlock()
+	a.disableTunnel(t)
 	writeJSON(w, 200, map[string]string{"status": "down"})
 }
 
@@ -645,9 +874,14 @@ func (a *App) serveLocal(sockPath string) {
 			return
 		}
 		if t.Enabled {
-			a.handleDisable(w, r)
+			a.disableTunnel(t)
+			writeJSON(w, 200, map[string]string{"status": "down"})
 		} else {
-			a.handleEnable(w, r)
+			if err := a.enableTunnel(t); err != nil {
+				writeJSON(w, 500, map[string]string{"error": err.Error()})
+				return
+			}
+			writeJSON(w, 200, map[string]string{"status": "up"})
 		}
 	})
 	log.Printf("local touch API on %s", sockPath)
@@ -702,6 +936,7 @@ func main() {
 		log.Fatalf("load state: %v", err)
 	}
 	app.ensureModule()
+	app.cleanupStaleDNS() // undo any DNS poison from an unclean prior shutdown, before bring-up
 	app.restore()
 	go app.serveLocal(sock)
 
