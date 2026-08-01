@@ -65,6 +65,7 @@ type App struct {
 	wgBin    string
 	ipBin    string
 	wggoBin  string // userspace WireGuard impl (wireguard-go / boringtun-cli)
+	wggoArgs string // extra args before the iface name (e.g. boringtun: --disable-drop-privileges)
 	backend  string // "kernel" (ip link add type wireguard) or "userspace" (TUN via wggoBin)
 
 	sessMu   sync.Mutex
@@ -190,7 +191,8 @@ func (a *App) up(t *Tunnel) error {
 	// Create the WireGuard interface. Either backend leaves a device named t.Name that
 	// `wg` configures identically (userspace impls expose the same UAPI socket).
 	if a.backend == "userspace" {
-		if _, err := run(a.wggoBin, t.Name); err != nil {
+		args := append(strings.Fields(a.wggoArgs), t.Name)
+		if _, err := run(a.wggoBin, args...); err != nil {
 			return fmt.Errorf("userspace backend (%s): %w", a.wggoBin, err)
 		}
 	} else {
@@ -236,7 +238,7 @@ func (a *App) down(t *Tunnel) error {
 	if a.backend == "userspace" {
 		// tear down the userspace impl + its UAPI socket (ip link del removes the TUN,
 		// which makes wireguard-go exit; kill defensively in case it lingers).
-		run("pkill", "-f", a.wggoBin+" "+t.Name)
+		run("pkill", "-f", a.wggoBin+".*"+t.Name)
 		os.Remove("/var/run/wireguard/" + t.Name + ".sock")
 	}
 	return nil
@@ -593,11 +595,15 @@ func main() {
 	// or ABI-incompatible with the running kernel.
 	backend := envOr("PWG_WG_BACKEND", "kernel")
 	wggoBin := envOr("PWG_WGGO", "wireguard-go")
+	// Extra args for the userspace impl, before the interface name. boringtun needs
+	// "--disable-drop-privileges" on systems where dropping to nobody fails; wireguard-go
+	// takes none. Space-separated.
+	wggoArgs := envOr("PWG_WGGO_ARGS", "")
 
 	os.MkdirAll(data, 0700)
 	app := &App{
 		dataPath: filepath.Join(data, "pocketwg.json"),
-		wgBin:    wgBin, ipBin: ipBin, wggoBin: wggoBin, backend: backend,
+		wgBin:    wgBin, ipBin: ipBin, wggoBin: wggoBin, wggoArgs: wggoArgs, backend: backend,
 		sessions: map[string]time.Time{},
 	}
 	if err := app.load(); err != nil {

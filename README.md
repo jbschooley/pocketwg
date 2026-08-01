@@ -49,6 +49,7 @@ Build without Docker: `CGO_ENABLED=0 go build -o pocketwg .`
 | `PWG_MODLOAD` | `modprobe wireguard` | command (via `sh -c`) to ensure the kernel module (kernel backend) |
 | `PWG_WG_BACKEND` | `kernel` | `kernel` (in-kernel `wireguard` netdev) or `userspace` (TUN via `wireguard-go`/boringtun) |
 | `PWG_WGGO` | `wireguard-go` | path to the userspace impl (used when `PWG_WG_BACKEND=userspace`) |
+| `PWG_WGGO_ARGS` | (empty) | extra args before the iface name; **boringtun** needs `--disable-drop-privileges` |
 | `PWG_SOCK` | `<data>/pocketwg.sock` | local unix socket for the touch UI |
 
 The **userspace** backend needs no kernel module (it runs WireGuard over TUN); the `wg` control plane
