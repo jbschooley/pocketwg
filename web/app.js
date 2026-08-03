@@ -41,6 +41,9 @@ $("li-go").onclick = async () => {
 $("logout").onclick = async () => { await api("/api/logout", { method: "POST" }); route(); };
 
 // ---- tunnels ----
+// name of the tunnel whose edit form is currently open; refresh() skips just this
+// one card so the poll keeps updating all the others without wiping the open form.
+let editing = null;
 function fmtBytes(n) {
   if (!n) return "0 B";
   const u = ["B", "KB", "MB", "GB", "TB"]; let i = 0;
@@ -49,7 +52,11 @@ function fmtBytes(n) {
 }
 function fmtAgo(sec) {
   if (!sec) return "never";
-  const d = Math.floor(Date.now() / 1000) - sec;
+  // boringtun's userspace `wg show dump` reports the handshake as seconds-SINCE-handshake
+  // (a small value that resets to 0 at each rekey), while the kernel / real wg reports an
+  // absolute Unix epoch. So: a large value is an epoch (subtract from now); a small value
+  // is already the age in seconds.
+  const d = sec >= 1000000000 ? Math.floor(Date.now() / 1000) - sec : sec;
   if (d < 0) return "just now";
   if (d < 60) return d + "s ago";
   if (d < 3600) return Math.floor(d / 60) + "m ago";
@@ -57,64 +64,83 @@ function fmtAgo(sec) {
   return Math.floor(d / 86400) + "d ago";
 }
 
+// Reconcile the tunnel list in place: update only the live fields on existing cards,
+// add/remove cards as tunnels appear/disappear, and never touch a card being edited.
+// This lets stats keep refreshing without wiping an open edit form.
 async function refresh() {
   const { ok, body } = await api("/api/tunnels");
   if (!ok) { if (body.error === "unauthorized") route(); return; }
   const box = $("tunnels");
-  box.innerHTML = "";
   const list = body.tunnels || [];
-  if (!list.length) {
-    box.innerHTML = '<div class="card muted">No tunnels yet — add one below.</div>';
-    return;
-  }
+  if (!list.length) { box.innerHTML = '<div class="card muted">No tunnels yet — add one below.</div>'; return; }
+  if (box.querySelector(".muted")) box.innerHTML = ""; // drop the empty-state placeholder
+  const seen = new Set();
   for (const t of list) {
-    const st = t.status || {}; const up = !!st.up;
-    const peer = (st.peers && st.peers[0]) || {};
-    const card = document.createElement("div");
-    card.className = "card";
-    card.innerHTML = `
-      <div class="row">
-        <div><span class="tname">${t.name}</span>
-          <span class="badge ${up ? "up" : "down"}">${up ? "up" : "down"}</span></div>
-        <label class="switch"><input type="checkbox" ${t.enabled ? "checked" : ""} data-n="${t.name}">
-          <span class="slider"></span></label>
-      </div>
-      <div class="meta">
-        ${peer.endpoint ? `endpoint <code>${peer.endpoint}</code> · ` : ""}
-        handshake ${fmtAgo(peer.last_handshake)} ·
-        ↓ ${fmtBytes(peer.rx_bytes)} ↑ ${fmtBytes(peer.tx_bytes)}
-      </div>
-      <div class="row" style="margin-top:10px; justify-content:flex-end; gap:8px">
-        <button class="ghost" data-edit="${t.name}">Edit</button>
-        <button class="danger" data-del="${t.name}">Delete</button>
-      </div>`;
-    box.appendChild(card);
+    seen.add(t.name);
+    let card = null;
+    box.querySelectorAll(".card[data-tunnel]").forEach((c) => { if (c.dataset.tunnel === t.name) card = c; });
+    if (!card) { card = buildCard(t); box.appendChild(card); }
+    if (editing === t.name) continue;                       // being edited — leave the form alone
+    if (card.querySelector(".ed-conf")) {                   // stale edit form (cancelled/saved) — restore
+      const fresh = buildCard(t); box.replaceChild(fresh, card); card = fresh;
+    }
+    updateCard(card, t);
   }
-  box.querySelectorAll("button[data-edit]").forEach((el) => {
-    el.onclick = () => editTunnel(el.dataset.edit, el.closest(".card"));
-  });
-  box.querySelectorAll("input[data-n]").forEach((el) => {
-    el.onchange = async () => {
-      el.disabled = true;
-      const name = el.dataset.n;
-      const { ok, body } = await api(`/api/tunnels/${name}/${el.checked ? "enable" : "disable"}`, { method: "POST" });
-      if (!ok) alert(body.error || "failed");
-      refresh();
-    };
-  });
-  box.querySelectorAll("button[data-del]").forEach((el) => {
-    el.onclick = async () => {
-      if (!confirm(`Delete tunnel ${el.dataset.del}?`)) return;
-      await api(`/api/tunnels/${el.dataset.del}`, { method: "DELETE" });
-      refresh();
-    };
-  });
+  box.querySelectorAll(".card[data-tunnel]").forEach((c) => { if (!seen.has(c.dataset.tunnel)) c.remove(); });
+}
+
+// build a fresh card with a stable structure; handlers are wired once (not re-attached each poll)
+function buildCard(t) {
+  const card = document.createElement("div");
+  card.className = "card";
+  card.dataset.tunnel = t.name;
+  card.innerHTML = `
+    <div class="row">
+      <div><span class="tname">${t.name}</span>
+        <span class="badge down">down</span></div>
+      <label class="switch"><input type="checkbox" data-n="${t.name}">
+        <span class="slider"></span></label>
+    </div>
+    <div class="meta"></div>
+    <div class="row" style="margin-top:10px; justify-content:flex-end; gap:8px">
+      <button class="ghost" data-edit="${t.name}">Edit</button>
+      <button class="danger" data-del="${t.name}">Delete</button>
+    </div>`;
+  card.querySelector("button[data-edit]").onclick = () => editTunnel(t.name, card);
+  card.querySelector("button[data-del]").onclick = async () => {
+    if (!confirm(`Delete tunnel ${t.name}?`)) return;
+    await api(`/api/tunnels/${t.name}`, { method: "DELETE" });
+    refresh();
+  };
+  card.querySelector("input[data-n]").onchange = async (e) => {
+    const cb = e.target; cb.disabled = true;
+    const { ok, body } = await api(`/api/tunnels/${t.name}/${cb.checked ? "enable" : "disable"}`, { method: "POST" });
+    if (!ok) alert(body.error || "failed");
+    cb.disabled = false;
+    refresh();
+  };
+  return card;
+}
+
+// update only the mutable fields of an existing card — no innerHTML rebuild, no lost handlers
+function updateCard(card, t) {
+  const st = t.status || {}; const up = !!st.up;
+  const peer = (st.peers && st.peers[0]) || {};
+  const badge = card.querySelector(".badge");
+  badge.className = "badge " + (up ? "up" : "down");
+  badge.textContent = up ? "up" : "down";
+  card.querySelector(".meta").innerHTML =
+    `${peer.endpoint ? `endpoint <code>${peer.endpoint}</code> · ` : ""}` +
+    `handshake ${fmtAgo(peer.last_handshake)} · ↓ ${fmtBytes(peer.rx_bytes)} ↑ ${fmtBytes(peer.tx_bytes)}`;
+  const cb = card.querySelector("input[data-n]");
+  if (cb && !cb.disabled) cb.checked = t.enabled; // don't fight an in-flight toggle
 }
 
 // ---- edit an existing tunnel ----
 async function editTunnel(name, card) {
+  editing = name; // mark before the fetch so a concurrent poll won't rebuild this card
   const { ok, body } = await api(`/api/tunnels/${name}/config`);
-  if (!ok) return;
+  if (!ok) { editing = null; return; }
   card.innerHTML = `
     <div class="tname">Edit ${name}</div>
     <textarea class="ed-conf" spellcheck="false"></textarea>
@@ -125,10 +151,11 @@ async function editTunnel(name, card) {
     </div>`;
   const ta = card.querySelector(".ed-conf");
   ta.value = body.conf; // set via value to avoid HTML escaping issues
-  card.querySelector(".ed-cancel").onclick = refresh;
+  card.querySelector(".ed-cancel").onclick = () => { editing = null; refresh(); };
   card.querySelector(".ed-save").onclick = async () => {
     const r = await api(`/api/tunnels/${name}`, { method: "PUT", body: JSON.stringify({ Conf: ta.value }) });
-    if (!r.ok) { card.querySelector(".ed-err").textContent = r.body.error || "error"; return; }
+    if (!r.ok) { card.querySelector(".ed-err").textContent = r.body.error || "error"; return; } // stay open on error
+    editing = null;
     refresh();
   };
 }
@@ -159,6 +186,7 @@ $("im-key").onclick = async () => {
   out.innerHTML = `PrivateKey <code>${body.private_key}</code><br>PublicKey <code>${body.public_key}</code>`;
 };
 
-// poll status while on the app view
+// poll status while on the app view — refresh() updates cards in place and skips the
+// one being edited, so live stats keep flowing without disturbing an open edit form
 setInterval(() => { if (!$("view-app").classList.contains("hidden")) refresh(); }, 5000);
 route();
