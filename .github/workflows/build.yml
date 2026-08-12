@@ -1,0 +1,76 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then echo "gofmt needed on:"; echo "$unformatted"; exit 1; fi
+      - run: go vet ./...
+
+  build:
+    needs: check
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # keep in sync with build.sh (arm64 amd64 arm mipsle)
+        arch: [amd64, arm64, arm, mipsle]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+      - name: build pocketwg-${{ matrix.arch }}
+        env:
+          CGO_ENABLED: '0'
+          GOOS: linux
+          GOARCH: ${{ matrix.arch }}
+        run: |
+          [ "$GOARCH" = arm ] && export GOARM=7
+          mkdir -p dist
+          go build -trimpath -ldflags="-s -w" -o "dist/pocketwg-${{ matrix.arch }}" .
+          ( cd dist && sha256sum "pocketwg-${{ matrix.arch }}" > "pocketwg-${{ matrix.arch }}.sha256" )
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pocketwg-${{ matrix.arch }}
+          path: |
+            dist/pocketwg-${{ matrix.arch }}
+            dist/pocketwg-${{ matrix.arch }}.sha256
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the release + upload assets
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: combined checksums
+        run: ( cd dist && cat pocketwg-*.sha256 > SHA256SUMS && cat SHA256SUMS )
+      - name: release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/pocketwg-*
+            dist/SHA256SUMS
+          generate_release_notes: true
