@@ -12,6 +12,10 @@ no dependencies — it drives the in-kernel WireGuard module via `wg` + `ip`.
 
 - **Import `.conf`** (upload or paste) — manage multiple client tunnels.
 - **Enable/disable** each tunnel with a toggle; **live status**: up/down, endpoint, last handshake, rx/tx.
+- **Self-healing** — a per-tunnel health monitor restarts a wedged tunnel so the engine rebinds a fresh
+  source port (recovers CGNAT mapping-death, where WireGuard keeps sending from the same dead port).
+  Zero-config by default (handshake-staleness detection); set a per-tunnel `probe` IP for fast,
+  definitive ping-through-tunnel checks. On by default; tune/disable via `PWG_HEALTH*` or per-tunnel config.
 - **wg-quick parity** — honors `Address`, `MTU`, `DNS` (resolver set/restore), `Table`, and
   full-tunnel routing (`AllowedIPs = 0.0.0.0/0` via fwmark policy routing + a pinned endpoint
   route so it works with **userspace** backends too), plus `PreUp`/`PostUp`/`PreDown`/`PostDown`
@@ -55,6 +59,13 @@ Build without Docker: `CGO_ENABLED=0 go build -o pocketwg .`
 | `PWG_WGGO` | `wireguard-go` | path to the userspace impl (used when `PWG_WG_BACKEND=userspace`) |
 | `PWG_WGGO_ARGS` | (empty) | extra args before the iface name; **boringtun** needs `--disable-drop-privileges` |
 | `PWG_SOCK` | `<data>/pocketwg.sock` | local unix socket for the touch UI |
+| `PWG_HEALTH` | `on` | self-healing health monitor; `off` disables it globally |
+| `PWG_HEALTH_INTERVAL` | `15` | seconds between health checks |
+| `PWG_HEALTH_STALE` | `150` | handshake-staleness threshold (seconds) for the zero-config detector |
+
+Per-tunnel health overrides live in the tunnel's `health` object in `pocketwg.json`:
+`{"off":false,"probe":"10.0.0.1","interval":10,"stale":150}` — set `probe` to ping an in-tunnel IP
+each interval (fast/definitive); leave it empty to use handshake-staleness detection (no target needed).
 
 The **userspace** backend needs no kernel module (it runs WireGuard over TUN); the `wg` control plane
 is identical, so status/config work the same either way.

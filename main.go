@@ -6,7 +6,7 @@
 // Tunnels are driven directly via `wg` + `ip` (the kernel wireguard module does
 // the work). State persists as JSON under PWG_DATA (default /var/lib/pocketwg).
 //
-// Copyright (C) 2026 Jacob Schooley
+// # Copyright (C) 2026 Jacob Schooley
 //
 // This program is free software: you can redistribute it and/or modify it under
 // the terms of the GNU Affero General Public License as published by the Free
@@ -48,10 +48,37 @@ var nameRE = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,15}$`) // valid tunnel/iface n
 // ---------- persistent state ----------
 
 type Tunnel struct {
-	Name      string `json:"name"`
-	Conf      string `json:"conf"`      // raw wg-quick-style config text
-	Enabled   bool   `json:"enabled"`   // desired state (restored on start)
-	Autostart bool   `json:"autostart"` // bring up at boot
+	Name      string     `json:"name"`
+	Conf      string     `json:"conf"`             // raw wg-quick-style config text
+	Enabled   bool       `json:"enabled"`          // desired state (restored on start)
+	Autostart bool       `json:"autostart"`        // bring up at boot
+	Health    *HealthCfg `json:"health,omitempty"` // per-tunnel health-check override (nil -> global defaults)
+}
+
+// HealthCfg tunes the per-tunnel liveness watchdog. All fields optional; zero values fall
+// back to the global defaults (PWG_HEALTH*). See monitorLoop for the detection logic.
+type HealthCfg struct {
+	Off   bool   `json:"off,omitempty"`   // disable health monitoring for this tunnel
+	Probe string `json:"probe,omitempty"` // ping this IP through the tunnel each interval;
+	// definitive + fast (~threshold*interval). If empty,
+	// use handshake-staleness detection (zero-config).
+	Interval int `json:"interval,omitempty"` // seconds between checks
+	Stale    int `json:"stale,omitempty"`    // handshake-staleness threshold (handshake mode), seconds
+}
+
+// healthDefaults holds the process-wide defaults from PWG_HEALTH* env.
+type healthDefaults struct {
+	on       bool
+	interval int
+	stale    int
+}
+
+// resolvedHealth is the effective config for one tunnel (per-tunnel over global).
+type resolvedHealth struct {
+	off      bool
+	probe    string
+	interval int
+	stale    int
 }
 
 type Store struct {
@@ -69,6 +96,12 @@ type App struct {
 	wggoBin  string // userspace WireGuard impl (wireguard-go / boringtun-cli)
 	wggoArgs string // extra args before the iface name (e.g. boringtun: --disable-drop-privileges)
 	backend  string // "kernel" (ip link add type wireguard) or "userspace" (TUN via wggoBin)
+
+	opMu sync.Mutex // serializes tunnel up/down/restart so the health monitor can't race enable/disable
+
+	health   healthDefaults
+	monMu    sync.Mutex
+	monitors map[string]chan struct{} // tunnel name -> stop signal for its health-monitor goroutine
 
 	sessMu   sync.Mutex
 	sessions map[string]time.Time // token -> expiry
@@ -111,8 +144,8 @@ type parsedConf struct {
 	dns       []string // Interface DNS = ... (nameserver IPs)
 	dnsSearch []string // Interface DNS = ... (non-IP entries -> search domains)
 	table     string   // Interface Table = auto|off|<id> ("" == auto)
-	saveConf  bool      // Interface SaveConfig = true (recognized; no-op here)
-	preUp     []string  // wg-quick hooks (run via sh -c, %i -> iface name)
+	saveConf  bool     // Interface SaveConfig = true (recognized; no-op here)
+	preUp     []string // wg-quick hooks (run via sh -c, %i -> iface name)
 	postUp    []string
 	preDown   []string
 	postDown  []string
@@ -293,11 +326,12 @@ func fwmarkFor(name string) string {
 }
 
 // addRoutes installs routes for the tunnel's AllowedIPs following wg-quick's Table rules:
-//   Table=off      -> no routes;
-//   Table=<id>     -> plain routes into that table;
-//   Table=auto ("")-> plain routes, unless a default route (0.0.0.0/0 or ::/0) is present,
-//                     in which case use policy routing (fwmark + suppress_prefixlength) so
-//                     the encrypted WG packets themselves aren't looped back into the tunnel.
+//
+//	Table=off      -> no routes;
+//	Table=<id>     -> plain routes into that table;
+//	Table=auto ("")-> plain routes, unless a default route (0.0.0.0/0 or ::/0) is present,
+//	                  in which case use policy routing (fwmark + suppress_prefixlength) so
+//	                  the encrypted WG packets themselves aren't looped back into the tunnel.
 func (a *App) addRoutes(t *Tunnel, p parsedConf) {
 	if p.table == "off" {
 		return
@@ -541,6 +575,170 @@ func (a *App) down(t *Tunnel) error {
 	return nil
 }
 
+// ---------- per-tunnel health monitor (self-healing) ----------
+//
+// WireGuard never rebinds its source port on its own: if the path dies while the same
+// UDP mapping is expected (classic CGNAT teardown — the client keeps sending, the peer
+// never answers), the tunnel stays wedged forever. This monitor watches each up tunnel
+// and, when it looks dead, restarts it (down+up) so the engine rebinds a fresh source
+// port and re-resolves the endpoint — the only thing that recovers that state.
+//
+// Detection (per tick):
+//   - Probe mode (Health.Probe set): ping that IP through the tunnel; N consecutive
+//     failures => dead. Definitive and fast (~N*interval); needs a reachable in-tunnel IP.
+//   - Handshake mode (default, zero-config): a tunnel that's up but whose last handshake is
+//     stale (or never happened) while it's actively trying to send is wedged. Uses WG's own
+//     state (`wg show dump`), so no probe target required. Idle tunnels (no tx) are left alone.
+
+func (a *App) healthCfg(t *Tunnel) resolvedHealth {
+	r := resolvedHealth{off: !a.health.on, interval: a.health.interval, stale: a.health.stale}
+	if h := t.Health; h != nil {
+		if h.Off {
+			r.off = true
+		}
+		if h.Probe != "" {
+			r.probe = h.Probe
+		}
+		if h.Interval > 0 {
+			r.interval = h.Interval
+		}
+		if h.Stale > 0 {
+			r.stale = h.Stale
+		}
+	}
+	if r.interval <= 0 {
+		r.interval = 15
+	}
+	if r.stale <= 0 {
+		r.stale = 150
+	}
+	return r
+}
+
+// startMonitor (re)starts the health goroutine for a tunnel. Idempotent: any existing
+// monitor for the name is stopped first, so it's safe to call on every up/adopt.
+func (a *App) startMonitor(t *Tunnel) {
+	cfg := a.healthCfg(t)
+	if cfg.off {
+		return
+	}
+	a.monMu.Lock()
+	if old, ok := a.monitors[t.Name]; ok {
+		close(old)
+		delete(a.monitors, t.Name)
+	}
+	stop := make(chan struct{})
+	a.monitors[t.Name] = stop
+	a.monMu.Unlock()
+	go a.monitorLoop(t, cfg, stop)
+}
+
+func (a *App) stopMonitor(name string) {
+	a.monMu.Lock()
+	if ch, ok := a.monitors[name]; ok {
+		close(ch)
+		delete(a.monitors, name)
+	}
+	a.monMu.Unlock()
+}
+
+// pingThrough pings target, which is expected to route through the tunnel (it's in the
+// tunnel's AllowedIPs). Best-effort: any error (unreachable, no ping binary) counts as down.
+func (a *App) pingThrough(target string) bool {
+	_, err := run("ping", "-c", "1", "-W", "3", target)
+	return err == nil
+}
+
+func (a *App) monitorLoop(t *Tunnel, cfg resolvedHealth, stop chan struct{}) {
+	iv := time.Duration(cfg.interval) * time.Second
+	// grace: let the tunnel handshake before the first check (and after each restart)
+	select {
+	case <-stop:
+		return
+	case <-time.After(iv):
+	}
+	var lastTx int64 = -1
+	fails := 0
+	// probe mode needs ~THRESHOLD fails; handshake mode confirms staleness over a couple ticks
+	probeThresh, hsThresh := 8, 2
+	for {
+		select {
+		case <-stop:
+			return
+		default:
+		}
+		st := a.status(t.Name)
+		if !st.Up {
+			// not up (mid-restart or externally torn down) — don't act, just wait
+			fails, lastTx = 0, -1
+			select {
+			case <-stop:
+				return
+			case <-time.After(iv):
+			}
+			continue
+		}
+		var peer PeerStatus
+		if len(st.Peers) > 0 {
+			peer = st.Peers[0]
+		}
+		dead := false
+		if cfg.probe != "" {
+			if a.pingThrough(cfg.probe) {
+				fails = 0
+			} else {
+				fails++
+			}
+			dead = fails >= probeThresh
+		} else {
+			neverHS := peer.LastHandshake == 0
+			stale := neverHS || time.Now().Unix()-peer.LastHandshake >= int64(cfg.stale)
+			sending := lastTx >= 0 && peer.TxBytes > lastTx // outbound traffic since last check
+			if stale && (neverHS || sending) {
+				fails++
+			} else {
+				fails = 0
+			}
+			lastTx = peer.TxBytes
+			dead = fails >= hsThresh
+		}
+		if dead {
+			log.Printf("health[%s]: unresponsive -> restarting for a new source port", t.Name)
+			a.restartHealth(t, stop)
+			fails, lastTx = 0, -1
+			// grace after restart before resuming checks
+			select {
+			case <-stop:
+				return
+			case <-time.After(iv):
+			}
+			continue
+		}
+		select {
+		case <-stop:
+			return
+		case <-time.After(iv):
+		}
+	}
+}
+
+// restartHealth cycles a tunnel (down+up) under opMu so it can't interleave with a
+// user-driven enable/disable. It re-checks the stop signal so a disable that fired while
+// we were waiting on opMu wins (leaves the tunnel down instead of resurrecting it).
+func (a *App) restartHealth(t *Tunnel, stop chan struct{}) {
+	a.opMu.Lock()
+	defer a.opMu.Unlock()
+	select {
+	case <-stop:
+		return // disabled while we waited for the lock — don't bring it back
+	default:
+	}
+	a.down(t)
+	if err := a.up(t); err != nil {
+		log.Printf("health[%s]: restart failed: %v", t.Name, err)
+	}
+}
+
 // ensureModule loads the wireguard kernel module. On a normal distro the default
 // `modprobe wireguard` works; embedded targets that ship a custom module set point
 // PWG_MODLOAD at an insmod sequence. Run via `sh -c` so the value may be a
@@ -568,10 +766,10 @@ type PeerStatus struct {
 	TxBytes       int64  `json:"tx_bytes"`
 }
 type TunnelStatus struct {
-	Name      string       `json:"name"`
-	Up        bool         `json:"up"`
-	ListenPort string      `json:"listen_port"`
-	Peers     []PeerStatus `json:"peers"`
+	Name       string       `json:"name"`
+	Up         bool         `json:"up"`
+	ListenPort string       `json:"listen_port"`
+	Peers      []PeerStatus `json:"peers"`
 }
 
 func (a *App) status(name string) TunnelStatus {
@@ -772,18 +970,25 @@ func (a *App) tunnelByPath(r *http.Request, suffix string) (*Tunnel, string) {
 // enableTunnel/disableTunnel are the core state transitions, shared by the HTTP API and
 // the local touch socket (so both drive the same up()/down() + persist path).
 func (a *App) enableTunnel(t *Tunnel) error {
-	if err := a.up(t); err != nil {
+	a.opMu.Lock()
+	err := a.up(t)
+	a.opMu.Unlock()
+	if err != nil {
 		return err
 	}
 	a.mu.Lock()
 	t.Enabled = true
 	a.save()
 	a.mu.Unlock()
+	a.startMonitor(t) // self-healing watchdog for as long as it's up
 	return nil
 }
 
 func (a *App) disableTunnel(t *Tunnel) {
+	a.stopMonitor(t.Name) // stop watching BEFORE tearing down so it can't restart it
+	a.opMu.Lock()
 	a.down(t)
+	a.opMu.Unlock()
 	a.mu.Lock()
 	t.Enabled = false
 	a.save()
@@ -815,14 +1020,19 @@ func (a *App) handleDisable(w http.ResponseWriter, r *http.Request) {
 
 func (a *App) handleDelete(w http.ResponseWriter, r *http.Request) {
 	name := strings.TrimPrefix(r.URL.Path, "/api/tunnels/")
+	a.stopMonitor(name)
 	a.mu.Lock()
 	t := a.store.Tunnels[name]
+	a.mu.Unlock()
 	if t != nil {
+		a.opMu.Lock()
 		a.down(t)
+		a.opMu.Unlock()
+		a.mu.Lock()
 		delete(a.store.Tunnels, name)
 		a.save()
+		a.mu.Unlock()
 	}
-	a.mu.Unlock()
 	writeJSON(w, 200, map[string]string{"status": "deleted"})
 }
 
@@ -883,11 +1093,16 @@ func (a *App) handleUpdate(w http.ResponseWriter, r *http.Request) {
 	a.save()
 	a.mu.Unlock()
 	if wasEnabled { // re-apply live so the edit takes effect immediately
+		a.stopMonitor(t.Name)
+		a.opMu.Lock()
 		a.down(t)
-		if err := a.up(t); err != nil {
+		err := a.up(t)
+		a.opMu.Unlock()
+		if err != nil {
 			writeJSON(w, 500, map[string]string{"error": "saved, but re-apply failed: " + err.Error()})
 			return
 		}
+		a.startMonitor(t) // pick up any changed health config
 	}
 	writeJSON(w, 200, map[string]string{"status": "ok"})
 }
@@ -942,7 +1157,8 @@ func (a *App) ifaceUp(name string) bool {
 //   - enabled + already up  -> ADOPT it (leave the working interface + its rules alone);
 //   - enabled + down         -> bring it up (auto-start what was enabled);
 //   - disabled + up          -> tear down the orphan (e.g. a tunnel left running when a
-//                               previous pocketwg died — its engine/interface outlive it).
+//     previous pocketwg died — its engine/interface outlive it).
+//
 // Adopting matters: a bare restart of pocketwg shouldn't flap a healthy tunnel.
 func (a *App) reconcile() {
 	a.mu.Lock()
@@ -964,9 +1180,11 @@ func (a *App) reconcile() {
 				log.Printf("reconcile: bring up %s: %v", t.Name, err)
 			} else {
 				log.Printf("reconcile: started %s (was enabled)", t.Name)
+				a.startMonitor(t)
 			}
 		case t.Enabled && up:
 			log.Printf("reconcile: adopted already-up %s", t.Name)
+			a.startMonitor(t)
 		case !t.Enabled && up:
 			log.Printf("reconcile: tore down orphaned %s (disabled but up)", t.Name)
 			a.down(t)
@@ -994,12 +1212,22 @@ func main() {
 	// "--disable-drop-privileges" on systems where dropping to nobody fails; wireguard-go
 	// takes none. Space-separated.
 	wggoArgs := envOr("PWG_WGGO_ARGS", "")
+	// Self-healing health monitor defaults (per-tunnel override via the tunnel's "health" field).
+	// PWG_HEALTH=off disables it globally. Handshake-staleness detection by default (zero-config);
+	// set a per-tunnel Health.Probe for faster, definitive ping-through-tunnel detection.
+	health := healthDefaults{
+		on:       envOr("PWG_HEALTH", "on") != "off",
+		interval: envInt("PWG_HEALTH_INTERVAL", 15),
+		stale:    envInt("PWG_HEALTH_STALE", 150),
+	}
 
 	os.MkdirAll(data, 0700)
 	app := &App{
 		dataPath: filepath.Join(data, "pocketwg.json"),
 		wgBin:    wgBin, ipBin: ipBin, wggoBin: wggoBin, wggoArgs: wggoArgs, backend: backend,
 		sessions: map[string]time.Time{},
+		monitors: map[string]chan struct{}{},
+		health:   health,
 	}
 	if err := app.load(); err != nil {
 		log.Fatalf("load state: %v", err)
@@ -1038,6 +1266,15 @@ func main() {
 func envOr(k, def string) string {
 	if v := os.Getenv(k); v != "" {
 		return v
+	}
+	return def
+}
+
+func envInt(k string, def int) int {
+	if v := os.Getenv(k); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
 	}
 	return def
 }
