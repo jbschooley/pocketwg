@@ -606,7 +606,9 @@ func (a *App) down(t *Tunnel) error {
 	for _, h := range p.preDown {
 		runHook("PreDown", t.Name, h)
 	}
-	a.restoreDNS(t)
+	if len(p.dns) > 0 { // symmetric with up()/applyDNS: only touch DNS for tunnels that set DNS=
+		a.restoreDNS(t)
+	}
 	a.teardownIface(t)
 	for _, h := range p.postDown {
 		runHook("PostDown", t.Name, h)
