@@ -59,6 +59,8 @@ Build without Docker: `CGO_ENABLED=0 go build -o pocketwg .`
 | `PWG_WGGO` | `wireguard-go` | path to the userspace impl (used when `PWG_WG_BACKEND=userspace`) |
 | `PWG_WGGO_ARGS` | (empty) | extra args before the iface name; **boringtun** needs `--disable-drop-privileges` |
 | `PWG_SOCK` | `<data>/pocketwg.sock` | local unix socket for the touch UI |
+| `PWG_DNS_UP` | (empty) | command (`sh -c`) to apply a tunnel's `DNS=`; gets `WG_TUNNEL`/`WG_DNS`/`WG_DNS_SEARCH` env. Empty ⇒ write `/etc/resolv.conf` |
+| `PWG_DNS_DOWN` | (empty) | command to revert `PWG_DNS_UP` (gets `WG_TUNNEL`) |
 | `PWG_HEALTH` | `on` | self-healing health monitor; `off` disables it globally |
 | `PWG_HEALTH_INTERVAL` | `15` | seconds between health checks |
 | `PWG_HEALTH_STALE` | `150` | handshake-staleness threshold (seconds) for the zero-config detector |

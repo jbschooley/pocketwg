@@ -97,6 +97,9 @@ type App struct {
 	wggoArgs string // extra args before the iface name (e.g. boringtun: --disable-drop-privileges)
 	backend  string // "kernel" (ip link add type wireguard) or "userspace" (TUN via wggoBin)
 
+	dnsUp   string // PWG_DNS_UP: command to apply a tunnel's DNS= (else write /etc/resolv.conf directly)
+	dnsDown string // PWG_DNS_DOWN: command to revert it
+
 	opMu sync.Mutex // serializes tunnel up/down/restart so the health monitor can't race enable/disable
 
 	health   healthDefaults
@@ -446,10 +449,35 @@ func (a *App) pinEndpointRoute(ip, table string) {
 	run(a.ipBin, args...)
 }
 
-// applyDNS points the resolver at the tunnel's DNS servers (wg-quick DNS=). No resolvconf
-// here, so back up /etc/resolv.conf once and write it directly; restoreDNS puts it back.
+// runEnv runs a command via `sh -c` with extra environment (KEY=VALUE) appended to the
+// process env. Used for the configurable DNS up/down hooks.
+func runEnv(env []string, cmd string) (string, error) {
+	c := exec.Command("sh", "-c", cmd)
+	c.Env = append(os.Environ(), env...)
+	out, err := c.CombinedOutput()
+	if err != nil {
+		return string(out), err
+	}
+	return string(out), nil
+}
+
+// applyDNS points the resolver at the tunnel's DNS servers (wg-quick DNS=). Default: back up
+// /etc/resolv.conf once and write it directly (restoreDNS puts it back). If PWG_DNS_UP is set,
+// run that instead — it receives WG_TUNNEL / WG_DNS (space-separated nameservers) / WG_DNS_SEARCH
+// in the environment, so a deployment can apply DNS however it likes (e.g. a LAN dnsmasq, resolvconf).
 func (a *App) applyDNS(t *Tunnel, p parsedConf) {
 	if len(p.dns) == 0 {
+		return
+	}
+	if a.dnsUp != "" {
+		env := []string{
+			"WG_TUNNEL=" + t.Name,
+			"WG_DNS=" + strings.Join(p.dns, " "),
+			"WG_DNS_SEARCH=" + strings.Join(p.dnsSearch, " "),
+		}
+		if out, err := runEnv(env, a.dnsUp); err != nil {
+			log.Printf("dns-up hook (%s): %v: %s", t.Name, err, strings.TrimSpace(out))
+		}
 		return
 	}
 	bak := a.resolvBak(t)
@@ -472,6 +500,12 @@ func (a *App) applyDNS(t *Tunnel, p parsedConf) {
 }
 
 func (a *App) restoreDNS(t *Tunnel) {
+	if a.dnsDown != "" {
+		if out, err := runEnv([]string{"WG_TUNNEL=" + t.Name}, a.dnsDown); err != nil {
+			log.Printf("dns-down hook (%s): %v: %s", t.Name, err, strings.TrimSpace(out))
+		}
+		return
+	}
 	bak := a.resolvBak(t)
 	if data, err := os.ReadFile(bak); err == nil {
 		os.WriteFile("/etc/resolv.conf", data, 0644)
@@ -489,6 +523,11 @@ func (a *App) resolvBak(t *Tunnel) string {
 // the peer Endpoint via a resolver that's only reachable *through* the not-yet-up tunnel,
 // deadlocking. Restoring first guarantees the endpoint resolves via the real upstream.
 func (a *App) cleanupStaleDNS() {
+	if a.dnsDown != "" {
+		// command mode: best-effort clear of any DNS left applied by an unclean prior shutdown
+		runEnv([]string{"WG_TUNNEL="}, a.dnsDown)
+		return
+	}
 	dir := filepath.Dir(a.dataPath)
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -1212,6 +1251,10 @@ func main() {
 	// "--disable-drop-privileges" on systems where dropping to nobody fails; wireguard-go
 	// takes none. Space-separated.
 	wggoArgs := envOr("PWG_WGGO_ARGS", "")
+	// Optional DNS apply/revert commands (wg-quick DNS=). Default writes /etc/resolv.conf; set these to
+	// apply DNS elsewhere (LAN dnsmasq, resolvconf, ...). The up cmd gets WG_TUNNEL/WG_DNS/WG_DNS_SEARCH env.
+	dnsUp := envOr("PWG_DNS_UP", "")
+	dnsDown := envOr("PWG_DNS_DOWN", "")
 	// Self-healing health monitor defaults (per-tunnel override via the tunnel's "health" field).
 	// PWG_HEALTH=off disables it globally. Handshake-staleness detection by default (zero-config);
 	// set a per-tunnel Health.Probe for faster, definitive ping-through-tunnel detection.
@@ -1225,6 +1268,7 @@ func main() {
 	app := &App{
 		dataPath: filepath.Join(data, "pocketwg.json"),
 		wgBin:    wgBin, ipBin: ipBin, wggoBin: wggoBin, wggoArgs: wggoArgs, backend: backend,
+		dnsUp: dnsUp, dnsDown: dnsDown,
 		sessions: map[string]time.Time{},
 		monitors: map[string]chan struct{}{},
 		health:   health,
